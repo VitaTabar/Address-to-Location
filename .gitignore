@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Input data and outputs
+data/
+output/
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.sbn
+*.sbx
+*.xlsx
+*.xls
+*.gpkg
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
