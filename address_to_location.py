@@ -1,5 +1,5 @@
 # =============================================================================
-# address_to_location.py
+# match_cameras_to_segments.py
 #
 # Matches traffic camera address records (Excel) to road segments (Shapefile).
 #
@@ -69,32 +69,63 @@
 #   when other components score well by coincidence.
 #
 # ── REQUIREMENTS ─────────────────────────────────────────────────────────────
-#   pip install geopandas pandas openpyxl rapidfuzz
+#   pip install geopandas pandas openpyxl rapidfuzz shapely pyogrio
 #
 # ── OUTPUT FILES ─────────────────────────────────────────────────────────────
-#   DirectMatch.xlsx    – rows matched exactly (Stage 1A, 1B, or 1C)
-#   FuzzyMatch.xlsx     – rows matched by component scoring (Stage 2)
-#   Unmatched.xlsx      – rows below threshold (needs manual review)
-#   all_matched.gpkg    – combined spatial layer for QGIS / ArcGIS
+#   DirectMatch.xlsx      – rows matched exactly (Stage 1A, 1B, or 1C)
+#   FuzzyMatch.xlsx       – rows matched by component scoring (Stage 2)
+#   Unmatched.xlsx        – unmatched camera records (original Excel columns)
+#   Unmatched.csv         – unmatched camera records (UTF-8 with BOM)
+#   filtered_streets.shp  – target district + neighbors (QGIS visual QA)
+#   DirectMatch.shp       – exact matches with segment geometry
+#   FuzzyMatch.shp        – fuzzy matches with segment geometry
+#   field_name_map.xlsx  – original column names -> Shapefile field names
+#
+# Parallel camera matching uses 70% of logical cores (rounded down); actual
+# percentage CPU utilization depends on I/O, workload, and other applications.
 # =============================================================================
 
 import os
 import re
+import time
+from concurrent.futures import ProcessPoolExecutor
+
+# Keep numeric libraries from spawning extra threads in each worker.
+# This helps keep active CPU work near the requested worker-core budget.
+for _thread_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                    "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ[_thread_var] = "1"
 import geopandas as gpd
 import pandas as pd
 from rapidfuzz import fuzz
+from shapely import wkt as shapely_wkt
 
-# ── USER SETTINGS ─────────────────────────────────────────────────────────────
-SHP_PATH   = os.environ.get("SHP_PATH",   os.path.join("data", "street_segments.shp"))   # .shp, .dbf, .shx, .prj must be together
-EXCEL_PATH = os.environ.get("EXCEL_PATH", os.path.join("data", "cameras.xlsx"))
+# ── USER SETTINGS (district-based filtering) ─────────────────────────────────
+DISTRICTS_SHP_PATH = r'C:\path\to\districts_tehran.shp'  # UPDATE to your district polygons
+DISTRICT_FIELD     = "District"       # column in the districts shapefile
+TARGET_DISTRICT    = 4                # exact district field value (as a string)
+STREETS_SHP_PATH   = r'C:\Users\windowse10\Desktop\TehranProject\street_tehran_regin134813.shp'
+EXCEL_PATH         = r'C:\Users\windowse10\Desktop\TehranProject\filtered_region4.xlsx'
 
-OUT_DIR = os.environ.get("CAMERA_MATCH_OUTPUT", "output")
-os.makedirs(OUT_DIR, exist_ok=True)
+METRIC_CRS         = "EPSG:32639"     # Tehran UTM zone 39N (meters)
+TOUCH_TOLERANCE_M  = 10               # tolerance for neighboring boundaries
+FILTER_MODE        = "midpoint"       # "midpoint" or "intersects"
 
-OUT_DIRECT    = os.path.join(OUT_DIR, "DirectMatch.xlsx")
-OUT_FUZZY     = os.path.join(OUT_DIR, "FuzzyMatch.xlsx")
-OUT_UNMATCHED = os.path.join(OUT_DIR, "Unmatched.xlsx")
-OUT_GPKG      = os.path.join(OUT_DIR, "all_matched.gpkg")
+# Parallel processing configuration (70% of available logical CPU cores).
+CPU_WORKER_FRACTION = 0.70
+CAMERA_BATCH_SIZE   = 100             # records per worker task
+WORKER_LIMIT        = None            # optional RAM safeguard (e.g. 4 or 8)
+
+
+OUT_FILTERED_STREETS = r"filtered_streets.shp"
+OUT_SHP_DIRECT       = r"DirectMatch.shp"
+OUT_SHP_FUZZY        = r"FuzzyMatch.shp"
+OUT_FIELD_MAP        = r"field_name_map.xlsx"
+
+OUT_DIRECT    = r"DirectMatch.xlsx"
+OUT_FUZZY     = r"FuzzyMatch.xlsx"
+OUT_UNMATCHED = r"Unmatched.xlsx"
+OUT_UNMATCHED_CSV = r"Unmatched.csv"
 
 COMPONENT_THRESHOLD    = 87
 NAME_FILTER_THRESH     = 65
@@ -104,6 +135,50 @@ DIR_PENALTY_FACTOR     = 0.80
 
 
 # ── HELPER FUNCTIONS ──────────────────────────────────────────────────────────
+
+def select_district_and_neighbors(districts_path, district_field, target_value,
+                                  streets_path, metric_crs, tol_m, mode):
+    """Return original-CRS streets in the target district and its neighbors."""
+    districts = gpd.read_file(districts_path, encoding="utf-8")
+    streets = gpd.read_file(streets_path, encoding="utf-8")
+
+    if districts.crs is None or streets.crs is None:
+        raise ValueError("Both shapefiles must have a CRS (.prj file missing?).")
+    if district_field not in districts.columns:
+        raise ValueError(f"'{district_field}' not in districts columns: "
+                         f"{list(districts.columns)}")
+    if mode not in ("midpoint", "intersects"):
+        raise ValueError("FILTER_MODE must be 'midpoint' or 'intersects'.")
+
+    # Transform copies only; return original-CRS streets for matching and output.
+    d_m = districts.to_crs(metric_crs)
+    s_m = streets.to_crs(metric_crs)
+
+    key = d_m[district_field].astype(str).str.strip()
+    is_target = key == str(target_value).strip()
+    if not is_target.any():
+        raise ValueError(f"District '{target_value}' not found. Available: "
+                         f"{sorted(key.unique().tolist())}")
+
+    def union(geometries):
+        return (geometries.union_all() if hasattr(geometries, "union_all")
+                else geometries.unary_union)
+
+    target_geom = union(d_m.loc[is_target].geometry)
+    near = d_m.geometry.intersects(target_geom.buffer(tol_m))
+    neighbors_mask = near & ~is_target
+    study_area = union(d_m.loc[is_target | neighbors_mask].geometry)
+
+    if mode == "intersects":
+        keep = s_m.geometry.intersects(study_area)
+    else:
+        keep = s_m.geometry.representative_point().within(study_area)
+
+    print(f"Target district   : {target_value}")
+    print(f"Neighbor districts: {sorted(key[neighbors_mask].tolist())}")
+    print(f"Streets: {len(streets):,} -> {int(keep.sum()):,} after filtering")
+    return streets.loc[keep.values].reset_index(drop=True)
+
 
 _NOISE = re.compile(r'\b(ورودی|خروجی|شمال|شمالی|جنوب|جنوبی|به|از)\b')
 
@@ -371,50 +446,6 @@ def score_candidate(cam, jht, shp_name, shp_oldname,
     return total, name_s, (orig_s or 0), (dest_s or 0), d_s
 
 
-# ── LOAD DATA ─────────────────────────────────────────────────────────────────
-print("Loading shapefile …")
-os.environ["SHAPE_RESTORE_SHX"] = "YES"
-gdf = gpd.read_file(SHP_PATH, encoding="utf-8")
-print(f"  {len(gdf):,} road segments  |  CRS: {gdf.crs}")
-print(f"  Districts in shapefile: {sorted(gdf['District'].dropna().unique().tolist())}")
-print(f"  Columns: {list(gdf.columns)}")
-
-print("Loading Excel …")
-excel = pd.read_excel(EXCEL_PATH)
-print(f"  {len(excel):,} camera records\n")
-
-for col in ["نام مکان", "جهت"]:
-    if col not in excel.columns:
-        raise ValueError(f"Required column '{col}' not found in Excel file.")
-
-# ── PRE-COMPUTE CLEANED SHAPEFILE COLUMNS ─────────────────────────────────────
-gdf["_mix_with_dist"] = gdf["MixValue"].apply(norm_with_district)
-gdf["_mix_no_dist"]   = gdf["MixValue"].apply(norm_no_district)
-gdf["_name"]          = gdf["Name"].apply(clean)
-gdf["_oldname"]       = gdf["OldName"].apply(clean)
-gdf["_orig"]          = gdf["Origin"].apply(clean)
-gdf["_dest"]          = gdf["Destinatio"].apply(clean)
-gdf["_dir"]           = gdf["NetDirecti"].apply(clean)
-gdf["_district"]      = gdf["District"].apply(lambda x: int(x) if pd.notna(x) else 0)
-
-print("Pre-computing shapefile lookup columns ... done")
-
-# Stage 1A: exact match with district
-mix_with_dist_idx = {}
-for idx, val in gdf["_mix_with_dist"].items():
-    if val:
-        mix_with_dist_idx[val] = idx
-
-# Stage 1B: cross-district exact match — key → list of (idx, district)
-mix_no_dist_idx = {}
-for idx, row in gdf.iterrows():
-    key = row["_mix_no_dist"]
-    if key:
-        mix_no_dist_idx.setdefault(key, []).append((idx, row["_district"]))
-
-print(f"Stage 1A lookup built: {len(mix_with_dist_idx):,} entries")
-print(f"Stage 1B lookup built: {len(mix_no_dist_idx):,} entries")
-
 SEG_COLS = [
     "OBJECTID", "TTCCID", "OldTTCCID",
     "Name", "LatinName", "OldName", "Summerized",
@@ -452,42 +483,33 @@ def make_direct_result(result, seg_idx, cam, stage_label):
     return result
 
 
-# ── MATCHING LOOP ─────────────────────────────────────────────────────────────
-direct_rows    = []
-fuzzy_rows     = []
-unmatched_rows = []
+# ── PARALLEL MATCHING WORKERS ─────────────────────────────────────────────────
+# These objects are initialized once per process, not sent with every camera.
+# On Windows, the executable program is protected by the __main__ guard below.
 
-import time
-_total_rows   = len(excel)
-_progress_every = 500
-_t0 = time.time()
+def initialize_worker(streets_gdf, with_dist_lookup, no_dist_lookup):
+    global gdf, mix_with_dist_idx, mix_no_dist_idx
+    gdf = streets_gdf
+    mix_with_dist_idx = with_dist_lookup
+    mix_no_dist_idx = no_dist_lookup
 
-print(f"\nStarting matching loop ({_total_rows:,} rows) ...")
 
-for _row_num, (_, cam_row) in enumerate(excel.iterrows(), start=1):
+def match_one_camera(cam_row):
+    """Run the original Stage 1A/1B/1C/2 matching logic for one camera.
 
-    # ── Progress report every N rows ─────────────────────────────────────────
-    if _row_num % _progress_every == 0 or _row_num == _total_rows:
-        elapsed   = time.time() - _t0
-        rate      = _row_num / elapsed if elapsed > 0 else 0
-        remaining = (_total_rows - _row_num) / rate if rate > 0 else 0
-        print(
-            f"  [{_row_num:>{len(str(_total_rows))}}/{_total_rows}] "
-            f"Direct={len(direct_rows)}  Fuzzy={len(fuzzy_rows)}  Unmatched={len(unmatched_rows)}  "
-            f"| {elapsed:.0f}s elapsed  ~{remaining:.0f}s remaining"
-        )
-
+    Returns (category, record). The main process alone collects and writes
+    outputs, so workers cannot overwrite one another's Shapefiles or Excel.
+    """
     raw_addr  = str(cam_row.get("نام مکان", ""))
     jht       = str(cam_row.get("جهت", ""))
-    result    = cam_row.to_dict()
+    result    = cam_row.copy()
     cam       = parse_camera_address(raw_addr)
     cam_dist  = cam_district(raw_addr)
 
     # ── Stage 1A: DirectMatch — exact with district ───────────────────────────
     key_with = norm_with_district(raw_addr)
     if key_with and key_with in mix_with_dist_idx:
-        direct_rows.append(make_direct_result(result, mix_with_dist_idx[key_with], cam, "exact"))
-        continue
+        return "direct", make_direct_result(result, mix_with_dist_idx[key_with], cam, "exact")
 
     # ── Stage 1B: DirectMatch — cross-district exact ──────────────────────────
     key_no = norm_no_district(raw_addr)
@@ -496,11 +518,9 @@ for _row_num, (_, cam_row) in enumerate(excel.iterrows(), start=1):
         # Prefer the row whose district matches the camera address district
         same_dist = [idx for idx, d in candidates if d == cam_dist]
         seg_idx = same_dist[0] if same_dist else candidates[0][0]
-        direct_rows.append(make_direct_result(result, seg_idx, cam, "cross-district"))
-        continue
+        return "direct", make_direct_result(result, seg_idx, cam, "cross-district")
 
-    # ── Stage 1C: DirectMatch — via OldName ──────────────────────────────────
-    matched_oldname = False
+    # ── Stage 1C: DirectMatch — via OldName ───────────────────────────────────
     if cam["seg_name"]:
         for idx, row in gdf[gdf["_oldname"] != ""].iterrows():
             if fuzz.token_sort_ratio(cam["seg_name"], row["_oldname"]) >= 90:
@@ -508,21 +528,14 @@ for _row_num, (_, cam_row) in enumerate(excel.iterrows(), start=1):
                     cam["seg_name"], row["_name"], 1
                 )
                 if reconstructed == row["_mix_no_dist"]:
-                    direct_rows.append(make_direct_result(result, idx, cam, "OldName"))
-                    matched_oldname = True
-                    break
-    if matched_oldname:
-        continue
+                    return "direct", make_direct_result(result, idx, cam, "OldName")
 
     # ── Stage 2: ComponentMatch ───────────────────────────────────────────────
     result["parsed_seg_name"] = cam["seg_name"]
     result["parsed_origin"]   = cam["origin"]
     result["parsed_dest"]     = cam["dest"]
 
-    # Candidate filter: Name or OldName similarity — district is NOT a filter.
-    # Uses the same probe list as score_candidate: for intersection-style
-    # records with no dedicated seg_name, try origin/dest as candidate names
-    # too, so a real match isn't filtered out just because seg_name is empty.
+    # Name/OldName are candidate filters; district is NOT a hard filter.
     name_probe_list = [cam["seg_name"]] if cam["seg_name"] else \
                        [t for t in (cam["origin"], cam["dest"]) if t]
     if name_probe_list:
@@ -558,12 +571,9 @@ for _row_num, (_, cam_row) in enumerate(excel.iterrows(), start=1):
         result["match_score_origin"]    = best_components[1]
         result["match_score_dest"]      = best_components[2]
         result["match_score_direction"] = best_components[3]
-        fuzzy_rows.append(result)
-        continue
+        return "fuzzy", result
 
     # ── Unmatched ─────────────────────────────────────────────────────────────
-    # No confirmed match. Attach the best candidate found (same columns as
-    # matched rows) so the analyst can review it. match_method stays "Unmatched".
     if best_idx is not None:
         result = attach_segment(result, best_idx)
     else:
@@ -576,63 +586,273 @@ for _row_num, (_, cam_row) in enumerate(excel.iterrows(), start=1):
     result["match_score_origin"]    = best_components[1]
     result["match_score_dest"]      = best_components[2]
     result["match_score_direction"] = best_components[3]
-    unmatched_rows.append(result)
+    return "unmatched", result
 
-# ── SUMMARY ───────────────────────────────────────────────────────────────────
-_total_elapsed = time.time() - _t0
-print(f"\nMatching loop finished in {_total_elapsed:.1f}s ({_total_elapsed/60:.1f} min)")
 
-print(f"{'─'*60}")
-print(f"  Total records       : {len(excel)}")
-print(f"  DirectMatch         : {len(direct_rows)}")
-print(f"  FuzzyMatch          : {len(fuzzy_rows)}")
-print(f"  Unmatched           : {len(unmatched_rows)}")
-print(f"{'─'*60}\n")
+def match_camera_batch(batch):
+    """Match a batch of cameras in one process without altering row order."""
+    return [match_one_camera(camera) for camera in batch]
 
-# ── SAVE EXCEL OUTPUTS ────────────────────────────────────────────────────────
-DROP = ["seg_geometry_wkt"] + _INTERNAL
 
-def save_excel(rows, path):
-    if rows:
-        df = pd.DataFrame(rows).drop(columns=DROP, errors="ignore")
-        df.to_excel(path, index=False)
-        print(f"Saved  →  {path}  ({len(rows)} rows)")
+def camera_batches(excel_df, size):
+    """Yield camera records in input order, avoiding a full extra data copy."""
+    batch = []
+    for _, row in excel_df.iterrows():
+        batch.append(row.to_dict())
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def worker_count(total_batches):
+    """Choose ~70% of logical CPUs, limited by the number of batches."""
+    if not 0 < CPU_WORKER_FRACTION <= 1:
+        raise ValueError("CPU_WORKER_FRACTION must be between 0 and 1.")
+    available = (len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity")
+                 else (os.cpu_count() or 1))
+    requested = max(1, int(available * CPU_WORKER_FRACTION))
+    if WORKER_LIMIT is not None:
+        if not isinstance(WORKER_LIMIT, int) or WORKER_LIMIT < 1:
+            raise ValueError("WORKER_LIMIT must be None or a positive integer.")
+        requested = min(requested, WORKER_LIMIT)
+    return min(requested, max(1, total_batches)), available
+
+
+def main():
+    # ── LOAD DATA ─────────────────────────────────────────────────────────────────
+    print("Loading and filtering shapefiles …")
+    os.environ["SHAPE_RESTORE_SHX"] = "YES"
+    gdf = select_district_and_neighbors(
+        DISTRICTS_SHP_PATH, DISTRICT_FIELD, TARGET_DISTRICT,
+        STREETS_SHP_PATH, METRIC_CRS, TOUCH_TOLERANCE_M, FILTER_MODE,
+    )
+    gdf.to_file(OUT_FILTERED_STREETS, driver="ESRI Shapefile", encoding="utf-8")  # QGIS QA layer
+    print(f"  {len(gdf):,} road segments  |  CRS: {gdf.crs}")
+    print(f"  Districts in shapefile: {sorted(gdf['District'].dropna().unique().tolist())}")
+    print(f"  Columns: {list(gdf.columns)}")
+
+    print("Loading Excel …")
+    excel = pd.read_excel(EXCEL_PATH)
+    print(f"  {len(excel):,} camera records\n")
+
+    for col in ["نام مکان", "جهت"]:
+        if col not in excel.columns:
+            raise ValueError(f"Required column '{col}' not found in Excel file.")
+
+    # ── PRE-COMPUTE CLEANED SHAPEFILE COLUMNS ─────────────────────────────────────
+    gdf["_mix_with_dist"] = gdf["MixValue"].apply(norm_with_district)
+    gdf["_mix_no_dist"]   = gdf["MixValue"].apply(norm_no_district)
+    gdf["_name"]          = gdf["Name"].apply(clean)
+    gdf["_oldname"]       = gdf["OldName"].apply(clean)
+    gdf["_orig"]          = gdf["Origin"].apply(clean)
+    gdf["_dest"]          = gdf["Destinatio"].apply(clean)
+    gdf["_dir"]           = gdf["NetDirecti"].apply(clean)
+    gdf["_district"]      = gdf["District"].apply(lambda x: int(x) if pd.notna(x) else 0)
+
+    print("Pre-computing shapefile lookup columns ... done")
+
+    # Stage 1A: exact match with district
+    mix_with_dist_idx = {}
+    for idx, val in gdf["_mix_with_dist"].items():
+        if val:
+            mix_with_dist_idx[val] = idx
+
+    # Stage 1B: cross-district exact match — key → list of (idx, district)
+    mix_no_dist_idx = {}
+    for idx, row in gdf.iterrows():
+        key = row["_mix_no_dist"]
+        if key:
+            mix_no_dist_idx.setdefault(key, []).append((idx, row["_district"]))
+
+    print(f"Stage 1A lookup built: {len(mix_with_dist_idx):,} entries")
+    print(f"Stage 1B lookup built: {len(mix_no_dist_idx):,} entries")
+
+# ── PARALLEL MATCHING LOOP ────────────────────────────────────────────────────
+    direct_rows    = []
+    fuzzy_rows     = []
+    unmatched_rows = []
+
+    _total_rows = len(excel)
+    _progress_every = 500
+    _t0 = time.time()
+    if CAMERA_BATCH_SIZE < 1:
+        raise ValueError("CAMERA_BATCH_SIZE must be a positive integer.")
+    _total_batches = (_total_rows + CAMERA_BATCH_SIZE - 1) // CAMERA_BATCH_SIZE
+    _workers, _available_cpus = worker_count(_total_batches)
+    print(f"\nStarting matching loop ({_total_rows:,} rows) ...")
+    print(f"  Available logical CPUs: {_available_cpus}")
+    print(f"  Target CPU share: {CPU_WORKER_FRACTION:.0%} of logical cores")
+    print(f"  Parallel workers: {_workers} | Batch size: {CAMERA_BATCH_SIZE}")
+
+    # Parent collects results in the same order as the Excel input.
+    # Only parent writes output files. Use 1 worker without extra processes.
+    if _workers == 1:
+        initialize_worker(gdf, mix_with_dist_idx, mix_no_dist_idx)
+        batches_results = map(match_camera_batch, camera_batches(excel, CAMERA_BATCH_SIZE))
+        process_pool = None
     else:
-        print(f"Skipped (empty)  →  {path}")
-
-print("Saving Excel outputs ...")
-try:
-    save_excel(direct_rows,    OUT_DIRECT)
-except Exception as e:
-    print(f"ERROR saving DirectMatch.xlsx: {e}")
-try:
-    save_excel(fuzzy_rows,     OUT_FUZZY)
-except Exception as e:
-    print(f"ERROR saving FuzzyMatch.xlsx: {e}")
-try:
-    save_excel(unmatched_rows, OUT_UNMATCHED)
-except Exception as e:
-    print(f"ERROR saving Unmatched.xlsx: {e}")
-
-# ── SAVE GEOPACKAGE ───────────────────────────────────────────────────────────
-print("Saving GeoPackage ...")
-try:
-    from shapely import wkt as shapely_wkt
-
-    all_matched = direct_rows + fuzzy_rows
-    if all_matched:
-        df_all = pd.DataFrame(all_matched).drop(columns=_INTERNAL, errors="ignore")
-        df_all["geometry"] = df_all["seg_geometry_wkt"].apply(
-            lambda w: shapely_wkt.loads(w) if pd.notna(w) else None
+        process_pool = ProcessPoolExecutor(
+            max_workers=_workers,
+            initializer=initialize_worker,
+            initargs=(gdf, mix_with_dist_idx, mix_no_dist_idx),
         )
-        gdf_out = gpd.GeoDataFrame(
-            df_all.drop(columns=["seg_geometry_wkt"], errors="ignore"),
-            geometry="geometry",
-            crs=gdf.crs
+        batches_results = process_pool.map(
+            match_camera_batch, camera_batches(excel, CAMERA_BATCH_SIZE)
         )
-        gdf_out.to_file(OUT_GPKG, driver="GPKG", layer="camera_segments")
-        print(f"Saved  →  {OUT_GPKG}  (CRS: {gdf.crs})")
-except Exception as e:
-    print(f"ERROR saving GeoPackage: {e}")
 
-print("\nDone.")
+    _processed = 0
+    _last_report = 0
+    try:
+        for batch_result in batches_results:
+            for category, row in batch_result:
+                if category == "direct":
+                    direct_rows.append(row)
+                elif category == "fuzzy":
+                    fuzzy_rows.append(row)
+                else:
+                    unmatched_rows.append(row)
+            _processed += len(batch_result)
+            if (_processed // _progress_every > _last_report // _progress_every
+                    or _processed == _total_rows):
+                elapsed = time.time() - _t0
+                rate = _processed / elapsed if elapsed > 0 else 0
+                remaining = (_total_rows - _processed) / rate if rate > 0 else 0
+                print(
+                    f"  [{_processed:>{len(str(_total_rows))}}/{_total_rows}] "
+                    f"Direct={len(direct_rows)}  Fuzzy={len(fuzzy_rows)} "
+                    f"Unmatched={len(unmatched_rows)}  "
+                    f"| {elapsed:.0f}s elapsed  ~{remaining:.0f}s remaining"
+                )
+                _last_report = _processed
+    finally:
+        if process_pool is not None:
+            process_pool.shutdown(wait=True, cancel_futures=True)
+
+    # ── SUMMARY ───────────────────────────────────────────────────────────────────
+    _total_elapsed = time.time() - _t0
+    print(f"\nMatching loop finished in {_total_elapsed:.1f}s ({_total_elapsed/60:.1f} min)")
+
+    print(f"{'─'*60}")
+    print(f"  Total records       : {len(excel)}")
+    print(f"  DirectMatch         : {len(direct_rows)}")
+    print(f"  FuzzyMatch          : {len(fuzzy_rows)}")
+    print(f"  Unmatched           : {len(unmatched_rows)}")
+    print(f"{'─'*60}\n")
+
+    # ── SHAPEFILE OUTPUT HELPERS ───────────────────────────────────────────────────
+    _MATCH_RENAME = {
+        "match_method": "m_method", "match_score": "m_score",
+        "match_score_name": "m_name", "match_score_origin": "m_origin",
+        "match_score_dest": "m_dest", "match_score_direction": "m_dir",
+        "parsed_seg_name": "p_name", "parsed_origin": "p_origin", "parsed_dest": "p_dest",
+    }
+
+
+    def rows_to_shapefile(rows, path, crs, excel_cols):
+        """Save matched rows with geometry, short ASCII field names, and UTF-8 text.
+
+        Return original-name to Shapefile-field mapping for the Excel lookup file.
+        Rows without candidate geometry cannot be represented in this spatial layer.
+        """
+        df = pd.DataFrame(rows)
+        geom = df["seg_geometry_wkt"].apply(
+            lambda w: shapely_wkt.loads(w) if pd.notna(w) and w else None)
+        df = df.drop(columns=["seg_geometry_wkt"] + _INTERNAL, errors="ignore")
+
+        rename = {}
+        for i, c in enumerate(excel_cols, start=1):
+            if c in df.columns:
+                rename[c] = f"c_{i:02d}"
+        for c in df.columns:
+            if c in rename:
+                continue
+            if c.startswith("seg_"):
+                rename[c] = c[4:][:10]
+            elif c in _MATCH_RENAME:
+                rename[c] = _MATCH_RENAME[c]
+            else:
+                rename[c] = re.sub(r"\W", "_", c)[:10]
+        if len(set(rename.values())) != len(rename):
+            raise ValueError("Duplicate Shapefile field names: check the input columns.")
+        mapping = pd.DataFrame({
+            "original": list(rename),
+            "shapefile_field": list(rename.values()),
+        })
+        df = df.rename(columns=rename)
+
+        # Shapefile cannot store datetime or mixed-type fields.
+        for c in df.columns:
+            if pd.api.types.is_datetime64_any_dtype(df[c]) or df[c].dtype == "object":
+                df[c] = df[c].astype(str).where(df[c].notna(), None)
+
+        out = gpd.GeoDataFrame(df, geometry=geom, crs=crs)
+        out = out[~out.geometry.isna()]
+        out.to_file(path, driver="ESRI Shapefile", encoding="utf-8")
+        print(f"Saved  →  {path}  ({len(out)} features)")
+        return mapping
+
+
+    # ── SAVE EXCEL OUTPUTS ────────────────────────────────────────────────────────
+    DROP = ["seg_geometry_wkt"] + _INTERNAL
+
+    def save_excel(rows, path):
+        if rows:
+            df = pd.DataFrame(rows).drop(columns=DROP, errors="ignore")
+            df.to_excel(path, index=False)
+            print(f"Saved  →  {path}  ({len(rows)} rows)")
+        else:
+            print(f"Skipped (empty)  →  {path}")
+
+    print("Saving Excel outputs ...")
+    try:
+        save_excel(direct_rows,    OUT_DIRECT)
+    except Exception as e:
+        print(f"ERROR saving DirectMatch.xlsx: {e}")
+    try:
+        save_excel(fuzzy_rows,     OUT_FUZZY)
+    except Exception as e:
+        print(f"ERROR saving FuzzyMatch.xlsx: {e}")
+    # Unmatched report: original camera data only (no best-candidate segment fields).
+    # UTF-8 with BOM makes Persian column names and text readable in Excel.
+    unmatched_cameras = pd.DataFrame(unmatched_rows).reindex(columns=excel.columns)
+    try:
+        unmatched_cameras.to_excel(OUT_UNMATCHED, index=False)
+        print(f"Saved  →  {OUT_UNMATCHED}  ({len(unmatched_cameras)} rows)")
+    except Exception as e:
+        print(f"ERROR saving {OUT_UNMATCHED}: {e}")
+    try:
+        unmatched_cameras.to_csv(OUT_UNMATCHED_CSV, index=False, encoding="utf-8-sig")
+        print(f"Saved  →  {OUT_UNMATCHED_CSV}  ({len(unmatched_cameras)} rows)")
+    except Exception as e:
+        print(f"ERROR saving {OUT_UNMATCHED_CSV}: {e}")
+
+    # ── SAVE SHAPEFILE OUTPUTS ────────────────────────────────────────────────────
+    print("Saving separate match Shapefiles ...")
+    excel_cols = list(excel.columns)
+    field_mapping = None
+    for rows, path in ((direct_rows, OUT_SHP_DIRECT), (fuzzy_rows, OUT_SHP_FUZZY)):
+        if not rows:
+            print(f"Skipped (no matches)  →  {path}")
+            continue
+        try:
+            current_mapping = rows_to_shapefile(rows, path, gdf.crs, excel_cols)
+            if field_mapping is None:
+                field_mapping = current_mapping
+        except Exception as e:
+            print(f"ERROR saving {path}: {e}")
+
+    if field_mapping is not None:
+        try:
+            field_mapping.to_excel(OUT_FIELD_MAP, index=False)
+            print(f"Saved  →  {OUT_FIELD_MAP}")
+        except Exception as e:
+            print(f"ERROR saving {OUT_FIELD_MAP}: {e}")
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
+
